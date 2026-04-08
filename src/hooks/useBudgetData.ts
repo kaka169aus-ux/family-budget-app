@@ -9,11 +9,9 @@ import {
   deleteAllTransactions,
   getSettings,
   saveSettings as dbSaveSettings,
-  getTransactionCount,
 } from "../lib/database";
 import { CATEGORIES, NEED_CATEGORIES, WANT_CATEGORIES, DEFAULT_SETTINGS } from "../lib/constants";
 import { monthKey, monthLabel, monthLabelShort, pctChange } from "../lib/utils";
-import { generateSampleData } from "../lib/sampleData";
 
 export function useBudgetData() {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
@@ -24,11 +22,6 @@ export function useBudgetData() {
   // ─── Load data ───
   const loadData = useCallback(async () => {
     try {
-      const count = await getTransactionCount();
-      if (count === 0) {
-        const sampleData = generateSampleData();
-        await insertManyTransactions(sampleData);
-      }
       const [txns, sett] = await Promise.all([getAllTransactions(), getSettings()]);
       setTransactions(txns);
       setSettings(sett);
@@ -71,6 +64,23 @@ export function useBudgetData() {
     [loadData]
   );
 
+  const removeMultipleTransactions = useCallback(
+    async (ids: string[]) => {
+      for (const id of ids) await deleteTransaction(id);
+      await loadData();
+    },
+    [loadData]
+  );
+
+  const copyTransaction = useCallback(
+    async (tx: Transaction) => {
+      const { id, created_at, ...rest } = tx;
+      await insertTransaction(rest);
+      await loadData();
+    },
+    [loadData]
+  );
+
   const importTransactions = useCallback(
     async (txns: Omit<Transaction, "id" | "created_at">[]) => {
       await insertManyTransactions(txns);
@@ -82,11 +92,10 @@ export function useBudgetData() {
 
   const resetToSample = useCallback(async () => {
     await deleteAllTransactions();
-    const sampleData = generateSampleData();
-    await insertManyTransactions(sampleData);
     await dbSaveSettings(DEFAULT_SETTINGS);
-    await loadData();
-  }, [loadData]);
+    setTransactions([]);
+    setSettings(DEFAULT_SETTINGS);
+  }, []);
 
   const updateSettings = useCallback(
     async (newSettings: Settings) => {
@@ -233,6 +242,8 @@ export function useBudgetData() {
     addTransaction,
     editTransaction,
     removeTransaction,
+    removeMultipleTransactions,
+    copyTransaction,
     importTransactions,
     resetToSample,
     updateSettings,

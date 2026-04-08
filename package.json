@@ -1,6 +1,6 @@
 {
   "name": "budgetapp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "main": "expo-router/entry",
   "scripts": {
     "start": "expo start",
@@ -16,6 +16,7 @@
     "expo-document-picker": "^55.0.11",
     "expo-file-system": "^55.0.14",
     "expo-haptics": "^55.0.11",
+    "expo-image-picker": "~17.0.10",
     "expo-linear-gradient": "^55.0.11",
     "expo-linking": "^55.0.11",
     "expo-router": "^55.0.10",

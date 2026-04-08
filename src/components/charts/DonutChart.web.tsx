@@ -17,15 +17,15 @@ export default function DonutChart({ data, total }: Props) {
   }));
 
   return (
-    <div style={{ width: 240, height: 220, flexShrink: 0 }}>
+    <div style={{ width: 150, height: 150, flexShrink: 0 }}>
       <ResponsiveContainer width="100%" height="100%">
         <PieChart>
           <Pie
             data={chartData}
             cx="50%"
             cy="50%"
-            innerRadius={52}
-            outerRadius={80}
+            innerRadius={40}
+            outerRadius={65}
             paddingAngle={2}
             dataKey="value"
           >

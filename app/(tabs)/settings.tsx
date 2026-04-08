@@ -98,17 +98,17 @@ export default function SettingsScreen() {
   };
 
   const handleReset = () => {
-    Alert.alert("确认重置", "所有数据将被清除并恢复为示例数据，此操作不可撤销。", [
+    Alert.alert("确认清空", "所有数据将被删除，此操作不可撤销。", [
       { text: "取消", style: "cancel" },
       {
-        text: "重置",
+        text: "清空",
         style: "destructive",
         onPress: async () => {
           await data.resetToSample();
           setPerson1("我");
           setPerson2("另一半");
           setSavingsGoal("50000");
-          Alert.alert("已重置", "数据已恢复为示例数据");
+          Alert.alert("已清空", "所有数据已删除");
         },
       },
     ]);
@@ -178,10 +178,10 @@ export default function SettingsScreen() {
             style={[s.actionBtn, { borderColor: "rgba(248,113,113,0.3)" }]}
             onPress={handleReset}
           >
-            <Text style={s.actionBtnIcon}>🔄</Text>
+            <Text style={s.actionBtnIcon}>�️</Text>
             <View>
               <Text style={[s.actionBtnTitle, { color: Colors.red }]}>
-                重置为示例数据
+                清空所有数据
               </Text>
               <Text style={s.actionBtnDesc}>清除所有数据并恢复示例</Text>
             </View>
@@ -192,7 +192,7 @@ export default function SettingsScreen() {
         <Card style={{ marginBottom: 20 }}>
           <SectionTitle>关于</SectionTitle>
           <Text style={s.aboutText}>
-            家庭记账本 v1.0.0{"\n"}
+            家庭记账本 v1.0.1{"\n"}
             双人家庭收支管理工具{"\n"}
             数据存储在本地，安全可靠
           </Text>

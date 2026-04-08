@@ -10,9 +10,11 @@ import {
   Alert,
   Platform,
   ActivityIndicator,
+  Image,
 } from "react-native";
 import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system";
+import * as ImagePicker from "expo-image-picker";
 import Papa from "papaparse";
 import { Colors, Spacing, BorderRadius } from "../lib/theme";
 import { CATEGORY_MAP } from "../lib/constants";
@@ -26,7 +28,7 @@ interface Props {
   settings: Settings;
 }
 
-type ImportMode = "file" | "text" | null;
+type ImportMode = "csv" | "pdf" | "screenshot" | "text" | null;
 
 export default function ImportModal({ visible, onClose, onImport, settings }: Props) {
   const [mode, setMode] = useState<ImportMode>(null);
@@ -34,7 +36,9 @@ export default function ImportModal({ visible, onClose, onImport, settings }: Pr
   const [person, setPerson] = useState(settings.person1);
   const [textInput, setTextInput] = useState("");
   const [parsing, setParsing] = useState(false);
+  const [imageUri, setImageUri] = useState<string | null>(null);
 
+  // ─── CSV row parser ─────────────────────────────────────────────────────
   const parseRows = (rows: Record<string, string>[]) => {
     return rows
       .map((r) => {
@@ -73,18 +77,117 @@ export default function ImportModal({ visible, onClose, onImport, settings }: Pr
             : cat === "savings"
             ? "savings"
             : "expense";
-        return {
-          date,
-          amount: absAmt,
-          category: cat,
-          description: desc || "未知交易",
-          person,
-          type,
-        };
+        return { date, amount: absAmt, category: cat, description: desc || "未知交易", person, type };
       })
       .filter((r) => r.amount > 0);
   };
 
+  // ─── Month name → number map ─────────────────────────────────────────────
+  const MONTH_MAP: Record<string, string> = {
+    january: "01", february: "02", march: "03", april: "04", may: "05", june: "06",
+    july: "07", august: "08", september: "09", october: "10", november: "11", december: "12",
+    jan: "01", feb: "02", mar: "03", apr: "04", jun: "06", jul: "07",
+    aug: "08", sep: "09", oct: "10", nov: "11", dec: "12",
+  };
+
+  // ─── Text line parser (manual text input) ──────────────────────────────
+  const parseTextLines = (raw: string) => {
+    const lines = raw.trim().split("\n").filter((l) => l.trim());
+    const results: Omit<Transaction, "id" | "created_at">[] = [];
+    for (const line of lines) {
+      let date = new Date().toISOString().slice(0, 10);
+      let amount = 0;
+      let desc = line.trim();
+
+      // Try YYYY-MM-DD or YYYY/MM/DD
+      const dateMatch = line.match(/(\d{4}[-/]\d{1,2}[-/]\d{1,2})/);
+      if (dateMatch) {
+        const parts = dateMatch[1].split(/[-/]/);
+        date = `${parts[0]}-${parts[1].padStart(2, "0")}-${parts[2].padStart(2, "0")}`;
+        desc = desc.replace(dateMatch[0], "").trim();
+      }
+
+      const amtMatch = line.match(/\$?([\d,]+\.?\d*)/);
+      if (amtMatch) {
+        amount = parseFloat(amtMatch[1].replace(/,/g, ""));
+        desc = desc.replace(amtMatch[0], "").trim();
+      }
+
+      if (amount > 0) {
+        const cat = autoCategory(desc);
+        const type: TransactionType =
+          cat === "income" ? "income" : cat === "investment" ? "investment" : cat === "savings" ? "savings" : "expense";
+        results.push({ date, amount, category: cat, description: desc || "未知交易", person, type });
+      }
+    }
+    return results;
+  };
+
+  // ─── Credit card / bank statement parser (for PDF) ─────────────────────
+  const parseStatement = (raw: string) => {
+    const lines = raw.split("\n").map((l) => l.trim()).filter(Boolean);
+    const results: Omit<Transaction, "id" | "created_at">[] = [];
+
+    // Detect year from header (e.g. "April 1, 2026" or "March 02 to April 1, 2026")
+    let year = new Date().getFullYear().toString();
+    const yearMatch = raw.match(/(?:20\d{2})/g);
+    if (yearMatch) year = yearMatch[yearMatch.length > 1 ? 1 : 0];
+
+    // Pattern: "March 14 DESCRIPTION 123.45" or "March 14 DESCRIPTION 1,234.56\nCR"
+    const monthPat = "(?:january|february|march|april|may|june|july|august|september|october|november|december)";
+    const txRegex = new RegExp(
+      `^(${monthPat})\\s+(\\d{1,2})\\s+(.+?)\\s+([\\d,]+\\.\\d{2})\\s*(cr)?$`,
+      "i"
+    );
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const m = line.match(txRegex);
+      if (!m) continue;
+
+      const monthNum = MONTH_MAP[m[1].toLowerCase()];
+      if (!monthNum) continue;
+      const day = m[2].padStart(2, "0");
+      const date = `${year}-${monthNum}-${day}`;
+      const rawDesc = m[3].trim();
+      const amount = parseFloat(m[4].replace(/,/g, ""));
+      const isCredit = !!m[5] || (i + 1 < lines.length && /^cr$/i.test(lines[i + 1]?.trim()));
+
+      if (amount <= 0) continue;
+
+      // Skip page headers, totals, etc.
+      if (/^total|^page\s+\d|^opening|^closing|^statement/i.test(rawDesc)) continue;
+
+      // Clean description: remove location-only suffixes, references
+      let desc = rawDesc
+        .replace(/\s*Reference:\s*/i, "")
+        .replace(/\s*Routing:.*$/i, "")
+        .replace(/\s*Ticket:.*$/i, "")
+        .replace(/\s*Passenger:.*$/i, "")
+        .replace(/\s*Card Number.*$/i, "")
+        .trim();
+
+      // Check for multi-line descriptions (next line could be category/reference)
+      if (i + 1 < lines.length && !/^(january|february|march|april|may|june|july|august|september|october|november|december)/i.test(lines[i + 1]) && !/^\d/.test(lines[i + 1]) && !/^total/i.test(lines[i + 1]) && !/^cr$/i.test(lines[i + 1]) && lines[i + 1].length < 60) {
+        // might be a sub-description like "GROCERIES" or "GOVERNMENT SERVICES"
+        // skip it as a separate line
+      }
+
+      const cat = autoCategory(desc);
+      let type: TransactionType;
+      if (isCredit) {
+        type = "income";
+      } else {
+        type = cat === "investment" ? "investment" : cat === "savings" ? "savings" : "expense";
+      }
+
+      results.push({ date, amount, category: isCredit ? "income" : cat, description: desc || "未知交易", person, type });
+    }
+
+    return results;
+  };
+
+  // ─── CSV file pick ──────────────────────────────────────────────────────
   const handleFilePick = async () => {
     try {
       const result = await DocumentPicker.getDocumentAsync({
@@ -113,60 +216,105 @@ export default function ImportModal({ visible, onClose, onImport, settings }: Pr
     }
   };
 
+  // ─── helper: read file as base64 (web vs native) ─────────────────────────
+  const readFileAsBase64 = async (fileAsset: any): Promise<string> => {
+    if (Platform.OS === "web") {
+      // Web: DocumentPicker gives a blob URI → use fetch + FileReader
+      const resp = await fetch(fileAsset.uri);
+      const blob = await resp.blob();
+      return new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = reader.result as string;
+          // strip "data:...;base64," prefix
+          resolve(dataUrl.split(",")[1] || "");
+        };
+        reader.onerror = () => reject(new Error("文件读取失败"));
+        reader.readAsDataURL(blob);
+      });
+    }
+    return FileSystem.readAsStringAsync(fileAsset.uri, {
+      encoding: FileSystem.EncodingType.Base64,
+    });
+  };
+
+  // ─── PDF file pick ──────────────────────────────────────────────────────
+  const handlePdfPick = async () => {
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: ["application/pdf"],
+        copyToCacheDirectory: true,
+      });
+      if (result.canceled || !result.assets?.[0]) return;
+      setParsing(true);
+      const base64 = await readFileAsBase64(result.assets[0]);
+      const res = await fetch("http://localhost:3001/api/import/pdf", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ base64 }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "PDF 解析失败");
+      setTextInput(data.text);
+      // Try statement parser first; fall back to simple text parser
+      const stmtResults = parseStatement(data.text);
+      setPreview(stmtResults.length > 0 ? stmtResults : parseTextLines(data.text));
+      setParsing(false);
+    } catch (e: any) {
+      Alert.alert("PDF 解析失败", e.message || "无法读取 PDF 文件");
+      setParsing(false);
+    }
+  };
+
+  // ─── Screenshot / Image pick ────────────────────────────────────────────
+  const handleImagePick = async (fromCamera: boolean) => {
+    try {
+      let result;
+      if (fromCamera) {
+        const perm = await ImagePicker.requestCameraPermissionsAsync();
+        if (!perm.granted) {
+          Alert.alert("权限不足", "需要相机权限才能拍照");
+          return;
+        }
+        result = await ImagePicker.launchCameraAsync({ quality: 0.8 });
+      } else {
+        result = await ImagePicker.launchImageLibraryAsync({
+          mediaTypes: ["images"],
+          quality: 0.8,
+        });
+      }
+      if (result.canceled || !result.assets?.[0]) return;
+      setImageUri(result.assets[0].uri);
+    } catch (e) {
+      Alert.alert("错误", "图片选择失败");
+    }
+  };
+
+  // ─── Text parse button ──────────────────────────────────────────────────
   const handleTextParse = () => {
     if (!textInput.trim()) return;
     setParsing(true);
     try {
-      const lines = textInput
-        .trim()
-        .split("\n")
-        .filter((l) => l.trim());
-      const results: Omit<Transaction, "id" | "created_at">[] = [];
-      for (const line of lines) {
-        let date = new Date().toISOString().slice(0, 10);
-        let amount = 0;
-        let desc = line.trim();
-
-        const dateMatch = line.match(/(\d{4}[-/]\d{1,2}[-/]\d{1,2})/);
-        if (dateMatch) {
-          const parts = dateMatch[1].split(/[-/]/);
-          date = `${parts[0]}-${parts[1].padStart(2, "0")}-${parts[2].padStart(2, "0")}`;
-          desc = desc.replace(dateMatch[0], "").trim();
-        }
-
-        const amtMatch = line.match(/\$?([\d,]+\.?\d*)/);
-        if (amtMatch) {
-          amount = parseFloat(amtMatch[1].replace(/,/g, ""));
-          desc = desc.replace(amtMatch[0], "").trim();
-        }
-
-        if (amount > 0) {
-          const cat = autoCategory(desc);
-          const type: TransactionType =
-            cat === "income" ? "income" : cat === "investment" ? "investment" : cat === "savings" ? "savings" : "expense";
-          results.push({ date, amount, category: cat, description: desc || "未知交易", person, type });
-        }
-      }
-      setPreview(results);
+      setPreview(parseTextLines(textInput));
     } catch {
       Alert.alert("解析失败", "文本格式无法识别");
     }
     setParsing(false);
   };
 
+  // ─── Confirm import ─────────────────────────────────────────────────────
   const handleImport = () => {
     if (preview.length === 0) return;
     onImport(preview);
-    setPreview([]);
-    setMode(null);
-    setTextInput("");
+    resetAll();
     onClose();
   };
 
-  const reset = () => {
+  const resetAll = () => {
     setPreview([]);
     setMode(null);
     setTextInput("");
+    setImageUri(null);
   };
 
   return (
@@ -192,35 +340,123 @@ export default function ImportModal({ visible, onClose, onImport, settings }: Pr
               ))}
             </View>
 
-            {/* Mode selector */}
-            {!mode && (
-              <View style={s.modeGrid}>
-                <TouchableOpacity style={s.modeCard} onPress={() => setMode("file")}>
-                  <Text style={s.modeIcon}>📄</Text>
-                  <Text style={s.modeName}>CSV 文件</Text>
-                  <Text style={s.modeDesc}>导入 .csv 银行账单</Text>
-                </TouchableOpacity>
-                <TouchableOpacity style={s.modeCard} onPress={() => setMode("text")}>
-                  <Text style={s.modeIcon}>📝</Text>
-                  <Text style={s.modeName}>文字输入</Text>
-                  <Text style={s.modeDesc}>粘贴或手打账单</Text>
-                </TouchableOpacity>
-              </View>
+            {/* ── Mode selector (2x2 grid) ─────────────────────────────── */}
+            {!mode && preview.length === 0 && (
+              <>
+                <View style={s.modeGrid}>
+                  <TouchableOpacity style={s.modeCard} onPress={() => setMode("csv")}>
+                    <Text style={s.modeIcon}>📄</Text>
+                    <Text style={s.modeName}>CSV 文件</Text>
+                    <Text style={s.modeDesc}>导入 .csv 银行账单</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={s.modeCard} onPress={() => setMode("pdf")}>
+                    <Text style={s.modeIcon}>📑</Text>
+                    <Text style={s.modeName}>PDF 导入</Text>
+                    <Text style={s.modeDesc}>解析 PDF 账单文件</Text>
+                  </TouchableOpacity>
+                </View>
+                <View style={[s.modeGrid, { marginTop: Spacing.md }]}>
+                  <TouchableOpacity style={s.modeCard} onPress={() => setMode("screenshot")}>
+                    <Text style={s.modeIcon}>📸</Text>
+                    <Text style={s.modeName}>截图识别</Text>
+                    <Text style={s.modeDesc}>拍照或选图 + 手动输入</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={s.modeCard} onPress={() => setMode("text")}>
+                    <Text style={s.modeIcon}>📝</Text>
+                    <Text style={s.modeName}>文字输入</Text>
+                    <Text style={s.modeDesc}>粘贴或手打账单</Text>
+                  </TouchableOpacity>
+                </View>
+              </>
             )}
 
-            {/* File mode */}
-            {mode === "file" && preview.length === 0 && (
+            {/* ── CSV mode ─────────────────────────────────────────────── */}
+            {mode === "csv" && preview.length === 0 && (
               <View style={s.actionArea}>
                 <TouchableOpacity style={s.pickBtn} onPress={handleFilePick}>
                   <Text style={s.pickBtnText}>选择 CSV 文件</Text>
                 </TouchableOpacity>
-                <TouchableOpacity style={s.backBtn} onPress={reset}>
+                <TouchableOpacity style={s.backBtn} onPress={resetAll}>
                   <Text style={s.backBtnText}>返回</Text>
                 </TouchableOpacity>
               </View>
             )}
 
-            {/* Text mode */}
+            {/* ── PDF mode ─────────────────────────────────────────────── */}
+            {mode === "pdf" && preview.length === 0 && (
+              <View style={s.actionArea}>
+                <Text style={s.modeHint}>
+                  选择 PDF 账单文件，系统将自动提取文字并解析交易记录
+                </Text>
+                <TouchableOpacity style={s.pickBtn} onPress={handlePdfPick}>
+                  <Text style={s.pickBtnText}>选择 PDF 文件</Text>
+                </TouchableOpacity>
+                {textInput.length > 0 && (
+                  <View style={s.extractedBox}>
+                    <Text style={s.extractedLabel}>提取到的文字：</Text>
+                    <Text style={s.extractedText} numberOfLines={8}>
+                      {textInput}
+                    </Text>
+                  </View>
+                )}
+                <TouchableOpacity style={s.backBtn} onPress={resetAll}>
+                  <Text style={s.backBtnText}>返回</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+
+            {/* ── Screenshot mode ──────────────────────────────────────── */}
+            {mode === "screenshot" && preview.length === 0 && (
+              <View style={s.actionArea}>
+                <Text style={s.modeHint}>
+                  拍照或从相册选取账单截图，然后手动输入识别到的内容
+                </Text>
+                <View style={s.imgBtnRow}>
+                  <TouchableOpacity style={s.imgBtn} onPress={() => handleImagePick(true)}>
+                    <Text style={s.imgBtnIcon}>📷</Text>
+                    <Text style={s.imgBtnText}>拍照</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={s.imgBtn} onPress={() => handleImagePick(false)}>
+                    <Text style={s.imgBtnIcon}>🖼️</Text>
+                    <Text style={s.imgBtnText}>相册选图</Text>
+                  </TouchableOpacity>
+                </View>
+
+                {imageUri && (
+                  <Image
+                    source={{ uri: imageUri }}
+                    style={s.imagePreview}
+                    resizeMode="contain"
+                  />
+                )}
+
+                <Text style={[s.label, { marginTop: Spacing.md }]}>
+                  请输入截图中的账单内容（每行一条）
+                </Text>
+                <TextInput
+                  style={s.textArea}
+                  value={textInput}
+                  onChangeText={setTextInput}
+                  placeholder={
+                    "参照截图输入，每行一条，例如：\n2026-04-01 Woolworths $185\n2026-04-02 房租 $2100"
+                  }
+                  placeholderTextColor={Colors.text3}
+                  multiline
+                  numberOfLines={5}
+                  textAlignVertical="top"
+                />
+                <View style={s.textBtnRow}>
+                  <TouchableOpacity style={s.parseBtn} onPress={handleTextParse}>
+                    <Text style={s.parseBtnText}>解析</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={s.backBtn} onPress={resetAll}>
+                    <Text style={s.backBtnText}>返回</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            )}
+
+            {/* ── Text mode ────────────────────────────────────────────── */}
             {mode === "text" && preview.length === 0 && (
               <View style={s.actionArea}>
                 <TextInput
@@ -239,7 +475,7 @@ export default function ImportModal({ visible, onClose, onImport, settings }: Pr
                   <TouchableOpacity style={s.parseBtn} onPress={handleTextParse}>
                     <Text style={s.parseBtnText}>解析</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity style={s.backBtn} onPress={reset}>
+                  <TouchableOpacity style={s.backBtn} onPress={resetAll}>
                     <Text style={s.backBtnText}>返回</Text>
                   </TouchableOpacity>
                 </View>
@@ -283,17 +519,20 @@ export default function ImportModal({ visible, onClose, onImport, settings }: Pr
                   <TouchableOpacity style={s.importBtn} onPress={handleImport}>
                     <Text style={s.importBtnText}>确认导入</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity style={s.backBtn} onPress={reset}>
+                  <TouchableOpacity style={s.backBtn} onPress={resetAll}>
                     <Text style={s.backBtnText}>取消</Text>
                   </TouchableOpacity>
                 </View>
               </View>
             )}
 
-            {/* Close */}
-            {!mode && (
-              <TouchableOpacity style={[s.backBtn, { marginTop: Spacing.lg }]} onPress={onClose}>
-                <Text style={s.backBtnText}>关闭</Text>
+            {/* Close (only on mode selector) */}
+            {!mode && preview.length === 0 && (
+              <TouchableOpacity
+                style={[s.closeBtn, { marginTop: Spacing.xl }]}
+                onPress={() => { resetAll(); onClose(); }}
+              >
+                <Text style={s.closeBtnText}>关闭</Text>
               </TouchableOpacity>
             )}
           </ScrollView>
@@ -357,7 +596,6 @@ const s = StyleSheet.create({
   modeGrid: {
     flexDirection: "row",
     gap: Spacing.md,
-    marginTop: Spacing.sm,
   },
   modeCard: {
     flex: 1,
@@ -365,13 +603,19 @@ const s = StyleSheet.create({
     borderStyle: "dashed",
     borderColor: Colors.border,
     borderRadius: BorderRadius.md,
-    padding: Spacing.xl,
+    padding: Spacing.lg,
     alignItems: "center",
   },
   modeIcon: { fontSize: 28, marginBottom: 6 },
   modeName: { fontSize: 13, fontWeight: "600", color: Colors.text },
   modeDesc: { fontSize: 11, color: Colors.text2, marginTop: 4, textAlign: "center" },
-  actionArea: { marginTop: Spacing.md },
+  modeHint: {
+    fontSize: 12,
+    color: Colors.text3,
+    marginBottom: Spacing.md,
+    lineHeight: 18,
+  },
+  actionArea: { marginTop: Spacing.md, gap: Spacing.md },
   pickBtn: {
     backgroundColor: Colors.surface2,
     borderWidth: 1,
@@ -381,6 +625,46 @@ const s = StyleSheet.create({
     alignItems: "center",
   },
   pickBtnText: { color: Colors.text, fontWeight: "500", fontSize: 14 },
+  imgBtnRow: {
+    flexDirection: "row",
+    gap: Spacing.md,
+  },
+  imgBtn: {
+    flex: 1,
+    backgroundColor: Colors.surface2,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    borderRadius: BorderRadius.sm,
+    paddingVertical: 16,
+    alignItems: "center",
+    gap: 4,
+  },
+  imgBtnIcon: { fontSize: 24 },
+  imgBtnText: { fontSize: 12, color: Colors.text2, fontWeight: "500" },
+  imagePreview: {
+    width: "100%",
+    height: 180,
+    borderRadius: BorderRadius.sm,
+    backgroundColor: Colors.surface2,
+  },
+  extractedBox: {
+    backgroundColor: Colors.surface2,
+    borderRadius: BorderRadius.sm,
+    padding: Spacing.md,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  extractedLabel: {
+    fontSize: 11,
+    fontWeight: "600",
+    color: Colors.text2,
+    marginBottom: 6,
+  },
+  extractedText: {
+    fontSize: 11,
+    color: Colors.text3,
+    lineHeight: 16,
+  },
   textArea: {
     backgroundColor: Colors.surface2,
     borderWidth: 1,
@@ -410,6 +694,15 @@ const s = StyleSheet.create({
     borderColor: Colors.border,
   },
   backBtnText: { color: Colors.text2, fontWeight: "500", fontSize: 14 },
+  closeBtn: {
+    backgroundColor: Colors.surface2,
+    paddingVertical: 14,
+    borderRadius: BorderRadius.sm,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  closeBtnText: { color: Colors.text2, fontWeight: "500", fontSize: 14 },
   loadingRow: {
     flexDirection: "row",
     alignItems: "center",
